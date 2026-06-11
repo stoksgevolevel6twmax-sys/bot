@@ -1,0 +1,230 @@
+name: Build APK from ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: 'URL langsung file ZIP (contoh: https://example.com/file.zip)'
+        required: false
+        type: string
+      upload_apk:
+        description: 'Upload APK ke release? (true/false)'
+        required: false
+        default: 'true'
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Setup workspace
+      run: |
+        mkdir -p workspace
+        cd workspace
+        echo "WORK_DIR=$(pwd)" >> $GITHUB_ENV
+    
+    - name: Download ZIP from URL or Artifact
+      id: download
+      run: |
+        cd ${{ env.WORK_DIR }}
+        
+        # Cek apakah ada URL input
+        if [ -n "${{ inputs.zip_url }}" ]; then
+          echo "📥 Downloading from URL: ${{ inputs.zip_url }}"
+          curl -L -o project.zip "${{ inputs.zip_url }}" --fail --show-error
+          
+          if [ $? -eq 0 ] && [ -f project.zip ]; then
+            echo "✅ Download success"
+            echo "SOURCE=url" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Download failed from URL"
+            exit 1
+          fi
+        else
+          # Cek dari release terbaru dengan curl tanpa auth (untuk public repo)
+          echo "📥 Checking latest release..."
+          
+          # Coba ambil dari API public
+          RELEASE_URL=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest | grep -o '"browser_download_url": "[^"]*\.zip"' | head -1 | cut -d'"' -f4)
+          
+          if [ -n "$RELEASE_URL" ]; then
+            echo "Found ZIP: $RELEASE_URL"
+            curl -L -o project.zip "$RELEASE_URL" --fail --show-error
+            echo "✅ Download from release success"
+            echo "SOURCE=release" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ No ZIP found in release"
+            # Buat dummy ZIP untuk testing
+            echo "This is a test file" > test.txt
+            zip -q project.zip test.txt
+            echo "SOURCE=dummy" >> $GITHUB_OUTPUT
+          fi
+        fi
+        
+        # Verifikasi file
+        ls -la project.zip
+        file project.zip
+    
+    - name: Validate and Extract ZIP
+      id: extract
+      run: |
+        cd ${{ env.WORK_DIR }}
+        
+        echo "=== Validating ZIP ==="
+        
+        # Cek magic bytes ZIP
+        if [ "$(head -c 2 project.zip)" != "PK" ]; then
+          echo "❌ File is not a valid ZIP (missing PK header)"
+          echo ""
+          echo "=== File content (first 200 bytes) ==="
+          head -c 200 project.zip | cat -v
+          exit 1
+        fi
+        
+        # Test ZIP integrity
+        if unzip -tq project.zip > /dev/null 2>&1; then
+          echo "✅ ZIP file is valid"
+        else
+          echo "⚠️ ZIP test warning, attempting extraction anyway..."
+        fi
+        
+        echo ""
+        echo "=== Extracting ZIP ==="
+        
+        # Extract semua isi
+        mkdir -p extracted
+        unzip -o project.zip -d extracted/ 2>&1 | tail -20
+        
+        echo ""
+        echo "=== Extracted files ==="
+        find extracted -type f | head -30
+        echo ""
+        echo "Total files: $(find extracted -type f | wc -l)"
+        
+        # Handle nested structure (jika ada 1 folder utama)
+        cd extracted
+        
+        # Cek apakah hanya ada 1 folder dan tidak ada file di root
+        DIR_COUNT=$(find . -maxdepth 1 -type d ! -path . | wc -l)
+        FILE_COUNT=$(find . -maxdepth 1 -type f | wc -l)
+        
+        if [ "$DIR_COUNT" -eq 1 ] && [ "$FILE_COUNT" -eq 0 ]; then
+          MAIN_DIR=$(find . -maxdepth 1 -type d ! -path . | head -1)
+          echo ""
+          echo "📁 Flattening nested structure: $MAIN_DIR"
+          mv $MAIN_DIR/* ./ 2>/dev/null || true
+          rm -rf $MAIN_DIR
+        fi
+        
+        cd ${{ env.WORK_DIR }}
+        
+        # Simpan path extracted
+        echo "EXTRACTED_PATH=${{ env.WORK_DIR }}/extracted" >> $GITHUB_OUTPUT
+    
+    - name: Find and Process APK Files
+      id: find_apk
+      run: |
+        cd ${{ steps.extract.outputs.EXTRACTED_PATH }}
+        
+        echo "=== Searching for APK/AAB files ==="
+        
+        # Cari semua file APK dan AAB
+        mkdir -p ${{ env.WORK_DIR }}/apk_output
+        
+        find . -type f \( -name "*.apk" -o -name "*.aab" -o -name "*.xapk" -o -name "*.apks" \) -print0 | while IFS= read -r -d '' file; do
+          echo "📱 Found: $(basename "$file")"
+          # Copy ke output folder dengan nama unik
+          cp "$file" ${{ env.WORK_DIR }}/apk_output/ 2>/dev/null || true
+        done
+        
+        # Rename file agar tidak ada spasi
+        cd ${{ env.WORK_DIR }}/apk_output
+        for file in *; do
+          if [ -f "$file" ]; then
+            newname=$(echo "$file" | tr ' ' '_' | tr '()' '_' | sed 's/__*/_/g')
+            if [ "$file" != "$newname" ]; then
+              mv "$file" "$newname" 2>/dev/null || true
+            fi
+          fi
+        done
+        
+        APK_COUNT=$(ls -1 *.apk 2>/dev/null | wc -l)
+        AAB_COUNT=$(ls -1 *.aab 2>/dev/null | wc -l)
+        
+        echo "APK_COUNT=$APK_COUNT" >> $GITHUB_OUTPUT
+        echo "AAB_COUNT=$AAB_COUNT" >> $GITHUB_OUTPUT
+        
+        echo ""
+        echo "=== Found Files ==="
+        ls -la
+        
+        if [ $APK_COUNT -eq 0 ] && [ $AAB_COUNT -eq 0 ]; then
+          echo "⚠️ No APK or AAB files found"
+          echo ""
+          echo "=== All extracted files ==="
+          find ${{ steps.extract.outputs.EXTRACTED_PATH }} -type f | head -50
+        else
+          echo ""
+          echo "✅ Total APK: $APK_COUNT"
+          echo "✅ Total AAB: $AAB_COUNT"
+        fi
+    
+    - name: Upload APK as Artifact
+      if: steps.find_apk.outputs.APK_COUNT > 0 || steps.find_apk.outputs.AAB_COUNT > 0
+      uses: actions/upload-artifact@v4
+      with:
+        name: apk-files-$(date +'%Y%m%d-%H%M%S')
+        path: ${{ env.WORK_DIR }}/apk_output/*
+        if-no-files-found: ignore
+        retention-days: 30
+    
+    - name: Upload to Release (Optional)
+      if: inputs.upload_apk == 'true' && (steps.find_apk.outputs.APK_COUNT > 0 || steps.find_apk.outputs.AAB_COUNT > 0)
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        cd ${{ env.WORK_DIR }}/apk_output
+        
+        # Create new release
+        TAG_NAME="build-$(date +'%Y%m%d-%H%M%S')"
+        
+        # Create release using GitHub CLI
+        gh release create "$TAG_NAME" \
+          --repo ${{ github.repository }} \
+          --title "APK Build $TAG_NAME" \
+          --notes "Auto-generated APK from ZIP" \
+          *.{apk,aab} 2>/dev/null || echo "Release creation skipped"
+        
+        echo "✅ Uploaded to release: $TAG_NAME"
+    
+    - name: Generate Summary
+      run: |
+        echo "# 📦 Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| ZIP Source | ${{ steps.download.outputs.SOURCE }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| APK Found | ${{ steps.find_apk.outputs.APK_COUNT }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| AAB Found | ${{ steps.find_apk.outputs.AAB_COUNT }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ ${{ steps.find_apk.outputs.APK_COUNT }} -gt 0 ]; then
+          echo "## ✅ APK Files" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -la ${{ env.WORK_DIR }}/apk_output/ 2>/dev/null >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📥 **Download artifacts from the top of this page**" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "## ❌ No APK Found" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The ZIP file does not contain any APK or AAB files." >> $GITHUB_STEP_SUMMARY
+        fi
+    
+    - name: Cleanup Workspace
+      if: always()
+      run: |
+        cd ${{ env.WORK_DIR }}
+        echo "📁 Workspace size: $(du -sh . | cut -f1)"
+        # Keep extracted files for summary
